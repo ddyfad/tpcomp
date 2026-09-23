@@ -17,6 +17,8 @@
 
 #define MAX_PENDING 16
 
+static const float NULL_ANGLES[2] = { 0.0, 0.0 };
+
 public Plugin myinfo =
 {
 	name = "tpcomp",
@@ -28,6 +30,7 @@ public Plugin myinfo =
 
 ConVar gCV_Enabled;
 ConVar gCV_Window;
+ConVar gCV_Pitch;
 
 int gI_PlayerState;
 
@@ -39,6 +42,13 @@ float gF_LastDelta[MAXPLAYERS+1][2];
 float gF_Pending[MAXPLAYERS+1][MAX_PENDING][2];
 int gI_PendingTick[MAXPLAYERS+1][MAX_PENDING];
 int gI_PendingCount[MAXPLAYERS+1];
+
+// An entry left as shavit's own absolute snap. That sets the client's angles
+// outright instead of adding to them, so it carries pitch, but the yaw the
+// player moved while it was in flight is thrown away and has to be handed back.
+bool gB_PendingSnap[MAXPLAYERS+1][MAX_PENDING];
+float gF_PendingTarget[MAXPLAYERS+1][MAX_PENDING][2];
+float gF_PendingFrom[MAXPLAYERS+1][MAX_PENDING];
 
 // Another plugin is handling the angles of this client's next loads itself.
 bool gB_Suspended[MAXPLAYERS+1];
@@ -57,6 +67,7 @@ public void OnPluginStart()
 {
 	gCV_Enabled = CreateConVar("sm_tpcomp_enabled", "1", "Compensate checkpoint teleport angles for latency.", 0, true, 0.0, true, 1.0);
 	gCV_Window = CreateConVar("sm_tpcomp_window", "2", "How many ticks past the teleport tick a command's tickcount can be before the client is assumed to have the new angle.", 0, true, 0.0, true, 64.0);
+	gCV_Pitch = CreateConVar("sm_tpcomp_pitch", "1", "Restore the checkpoint pitch. Off keeps the old yaw-only behaviour, where the view never jumps but pitch is left alone.", 0, true, 0.0, true, 1.0);
 
 	gI_PlayerState = FindSendPropInfo("CBasePlayer", "deadflag");
 
@@ -122,6 +133,12 @@ public void Shavit_OnCheckpointCacheLoaded(int client, cp_cache_t cache, int ind
 	GetEntDataVector(client, gI_PlayerState + V_ANGLE_OFFSET, target);
 	GetEntDataVector(client, gI_PlayerState + ANGLECHANGE_OFFSET, change);
 
+	if (gCV_Pitch.BoolValue)
+	{
+		SnapAndCatchUp(client, target);
+		return;
+	}
+
 	float shift[2], d[2];
 	PendingShift(client, shift);
 
@@ -140,16 +157,7 @@ public void Shavit_OnCheckpointCacheLoaded(int client, cp_cache_t cache, int ind
 	}
 	else if (d[0] != 0.0 || d[1] != 0.0)
 	{
-		if (n == MAX_PENDING)
-		{
-			PopPending(client);
-			n--;
-		}
-
-		gF_Pending[client][n][0] = d[0];
-		gF_Pending[client][n][1] = d[1];
-		gI_PendingTick[client][n] = GetGameTickCount();
-		gI_PendingCount[client]++;
+		PushPending(client, d, false, NULL_ANGLES, 0.0);
 	}
 
 	change[0] += d[0];
@@ -160,12 +168,45 @@ public void Shavit_OnCheckpointCacheLoaded(int client, cp_cache_t cache, int ind
 	SetEntDataVector(client, gI_PlayerState + ANGLECHANGE_OFFSET, change);
 }
 
+// Leave shavit's snap alone so the client gets the checkpoint pitch, and note
+// where the player was looking so the yaw the snap eats can be handed back once
+// it lands.
+void SnapAndCatchUp(int client, const float target[3])
+{
+	float d[2], aim[2];
+
+	for (int i = 0; i < 2; i++)
+	{
+		aim[i] = target[i];
+		d[i] = NormalizeAngle(target[i] - gF_LastAngles[client][i]);
+	}
+
+	if (d[0] == 0.0 && d[1] == 0.0)
+	{
+		return;
+	}
+
+	// The snap lands on the checkpoint angles whatever else is queued, so
+	// anything the client hasn't applied yet stops mattering and the shift for
+	// commands still in flight is the whole way from where the player is.
+	gI_PendingCount[client] = 0;
+
+	PushPending(client, d, true, aim, gF_LastAngles[client][1]);
+
+	// An unsent anglechange would ride along with the next relative snap
+	SetEntDataVector(client, gI_PlayerState + ANGLECHANGE_OFFSET, NULL_VECTOR);
+}
+
 public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3], float angles[3], int &weapon, int &subtype, int &cmdnum, int &tickcount, int &seed, int mouse[2])
 {
 	if (IsFakeClient(client))
 	{
 		return Plugin_Continue;
 	}
+
+	float prevAngles[2], prevDelta[2];
+	prevAngles = gF_LastAngles[client];
+	prevDelta = gF_LastDelta[client];
 
 	float delta[2], jump[2];
 
@@ -180,18 +221,43 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
 
 	if (gI_PendingCount[client] > 0)
 	{
-		float dp = gF_Pending[client][0][0];
-		float dy = gF_Pending[client][0][1];
+		bool snap = gB_PendingSnap[client][0];
+		float expect[2];
+
+		if (snap)
+		{
+			// A snap replaces the angles, so the change that shows up is the
+			// whole distance to the checkpoint rather than a fixed amount.
+			for (int i = 0; i < 2; i++)
+			{
+				expect[i] = NormalizeAngle(gF_PendingTarget[client][0][i] - prevAngles[i]) - prevDelta[i];
+			}
+		}
+		else
+		{
+			expect[0] = gF_Pending[client][0][0];
+			expect[1] = gF_Pending[client][0][1];
+		}
+
 		int tick = gI_PendingTick[client][0];
 
-		// First command after the client applies d jumps by about d
-		float miss = FloatAbs(jump[0] - dp) + FloatAbs(jump[1] - dy);
+		// First command after the client applies the change jumps by about it
+		float miss = FloatAbs(jump[0] - expect[0]) + FloatAbs(jump[1] - expect[1]);
 
 		if (tickcount >= tick && (miss < FloatAbs(jump[0]) + FloatAbs(jump[1]) || tickcount > tick + gCV_Window.IntValue))
 		{
-			gF_LastDelta[client][0] = delta[0] - dp;
-			gF_LastDelta[client][1] = delta[1] - dy;
+			gF_LastDelta[client][0] = delta[0] - expect[0];
+			gF_LastDelta[client][1] = delta[1] - expect[1];
+
+			// Everything the player turned while the snap was in flight
+			float lost = snap ? NormalizeAngle(prevAngles[1] - gF_PendingFrom[client][0]) : 0.0;
+
 			PopPending(client);
+
+			if (lost != 0.0)
+			{
+				GiveBackYaw(client, lost);
+			}
 		}
 	}
 
@@ -208,6 +274,48 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
 	angles[1] = NormalizeAngle(angles[1] + shift[1]);
 
 	return Plugin_Changed;
+}
+
+// The snap threw the player's own turning away. Send it back as a relative
+// change, which the client adds to wherever it is looking, and keep shifting
+// commands by it until the client has it.
+void GiveBackYaw(int client, float amount)
+{
+	if (GetEntData(client, gI_PlayerState + FIXANGLE_OFFSET) != 0)
+	{
+		return;
+	}
+
+	float change[3];
+	change[1] = amount;
+
+	SetEntData(client, gI_PlayerState + FIXANGLE_OFFSET, FIXANGLE_RELATIVE);
+	SetEntDataVector(client, gI_PlayerState + ANGLECHANGE_OFFSET, change);
+
+	float d[2];
+	d[1] = amount;
+
+	PushPending(client, d, false, NULL_ANGLES, 0.0);
+}
+
+void PushPending(int client, const float d[2], bool snap, const float target[2], float from)
+{
+	int n = gI_PendingCount[client];
+
+	if (n == MAX_PENDING)
+	{
+		PopPending(client);
+		n--;
+	}
+
+	gF_Pending[client][n][0] = d[0];
+	gF_Pending[client][n][1] = d[1];
+	gB_PendingSnap[client][n] = snap;
+	gF_PendingTarget[client][n][0] = target[0];
+	gF_PendingTarget[client][n][1] = target[1];
+	gF_PendingFrom[client][n] = from;
+	gI_PendingTick[client][n] = GetGameTickCount();
+	gI_PendingCount[client]++;
 }
 
 void PendingShift(int client, float shift[2])
@@ -230,6 +338,10 @@ void PopPending(int client)
 	{
 		gF_Pending[client][i][0] = gF_Pending[client][i + 1][0];
 		gF_Pending[client][i][1] = gF_Pending[client][i + 1][1];
+		gB_PendingSnap[client][i] = gB_PendingSnap[client][i + 1];
+		gF_PendingTarget[client][i][0] = gF_PendingTarget[client][i + 1][0];
+		gF_PendingTarget[client][i][1] = gF_PendingTarget[client][i + 1][1];
+		gF_PendingFrom[client][i] = gF_PendingFrom[client][i + 1];
 		gI_PendingTick[client][i] = gI_PendingTick[client][i + 1];
 	}
 }

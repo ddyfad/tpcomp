@@ -11,9 +11,11 @@ When a checkpoint loads, shavit teleports you with the saved angles. The server 
 
 ## What this does
 
-After shavit's teleport, the plugin changes the pending absolute snap into the engine's relative mode (`FIXANGLE_RELATIVE`). The client then adds the yaw difference to wherever it's looking, so mouse movement is kept. Until the client has applied that difference, the server adds the same difference to every incoming command's yaw. The first command made after the client applies it shows a yaw jump of that size, and that jump is how the plugin knows to stop shifting.
+Until the client has the new angles, the server adds the teleport's angle difference to every incoming command's yaw, so commands still carrying the old yaw move you in the right direction relative to your new velocity. The first command made after the client applies the new angles shows a yaw jump of about that size, and that jump is how the plugin knows to stop shifting.
 
-Pitch from the checkpoint isn't restored, because the relative snap only carries yaw. Movement ignores pitch anyway.
+Keeping mouse movement needs the engine's relative snap (`FIXANGLE_RELATIVE`), because the client adds that to wherever it's looking instead of replacing the view. It only carries yaw: `CL_ApplyAddAngle` ignores the pitch component. So shavit's absolute snap is left in place, which lands the checkpoint pitch and yaw exactly the way a normal teleport does, and the plugin measures how far the player turned while that snap was in flight and hands it back as a relative change once the snap lands. The view ends up on the checkpoint angles plus everything the player did with the mouse in the meantime, same as the old yaw-only version, with pitch as well.
+
+What this costs is that the view sits on the checkpoint yaw for about one round trip before it catches up, instead of never jumping at all. Server-side the shifting is unchanged, so movement is correct the whole way through. `sm_tpcomp_pitch 0` goes back to the old behaviour: no jump, and pitch left wherever the player was looking.
 
 ## Results
 
@@ -26,9 +28,12 @@ These came from alternating compensated and default loads on a 100 tick server. 
 | ~162ms | tpcomp | 2.0° | 0.4° |
 | ~162ms | default | 71.7° | 87.4° |
 
+These were measured with the yaw-only behaviour, now `sm_tpcomp_pitch 0`. Misalignment is the same with pitch restore on, since the server-side shifting doesn't change. The yaw jump column doesn't hold: the view lands on the checkpoint yaw first and catches up a round trip later, so it sits between the two rows.
+
 ## Cvars
 
 - `sm_tpcomp_enabled` (1): turn compensation on or off.
+- `sm_tpcomp_pitch` (1): restore the checkpoint pitch. Off keeps the old yaw-only behaviour.
 - `sm_tpcomp_window` (2): how many ticks past the teleport tick to wait for the yaw jump before assuming the client has the new angle.
 
 ## Requirements
