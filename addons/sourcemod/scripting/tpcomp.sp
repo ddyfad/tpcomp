@@ -1,5 +1,6 @@
 #include <sourcemod>
 #include <sdktools>
+#include <clientprefs>
 #include <shavit/core>
 #include <shavit/checkpoints>
 
@@ -30,13 +31,27 @@ ConVar gCV_Window;
 
 int gI_PlayerState;
 
-float gF_LastYaw[MAXPLAYERS+1];
-float gF_LastDelta[MAXPLAYERS+1];
+// Pitch and yaw
+float gF_LastAngles[MAXPLAYERS+1][2];
+float gF_LastDelta[MAXPLAYERS+1][2];
 
-// Yaw changes the client hasn't applied yet, oldest first
-float gF_Pending[MAXPLAYERS+1][MAX_PENDING];
+// Angle changes the client hasn't applied yet, oldest first
+float gF_Pending[MAXPLAYERS+1][MAX_PENDING][2];
 int gI_PendingTick[MAXPLAYERS+1][MAX_PENDING];
 int gI_PendingCount[MAXPLAYERS+1];
+
+// Another plugin is handling the angles of this client's next loads itself.
+bool gB_Suspended[MAXPLAYERS+1];
+
+// better-seg's !seg_freeze setting. Frozen players already get their angles fixed by the freeze.
+Cookie gC_SegFreeze;
+
+public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max)
+{
+	CreateNative("TPComp_Suspend", Native_Suspend);
+	RegPluginLibrary("tpcomp");
+	return APLRes_Success;
+}
 
 public void OnPluginStart()
 {
@@ -54,11 +69,45 @@ public void OnPluginStart()
 public void OnClientPutInServer(int client)
 {
 	gI_PendingCount[client] = 0;
+	gB_Suspended[client] = false;
+}
+
+public void OnAllPluginsLoaded()
+{
+	gC_SegFreeze = Cookie.Find("betterseg_freeze");
+}
+
+public any Native_Suspend(Handle plugin, int numParams)
+{
+	gB_Suspended[GetNativeCell(1)] = GetNativeCell(2);
+	return 0;
+}
+
+// Same conditions better-seg freezes under: setting on (the default) and the run timer started
+bool SegFreezing(int client)
+{
+	if (gC_SegFreeze == null)
+	{
+		return false;
+	}
+
+	if (AreClientCookiesCached(client))
+	{
+		char buf[8];
+		gC_SegFreeze.Get(client, buf, sizeof(buf));
+
+		if (buf[0] != '\0' && StringToInt(buf) == 0)
+		{
+			return false;
+		}
+	}
+
+	return Shavit_GetTimerStatus(client) != Timer_Stopped && Shavit_GetClientTime(client) > 5.0 * GetTickInterval();
 }
 
 public void Shavit_OnCheckpointCacheLoaded(int client, cp_cache_t cache, int index)
 {
-	if (!gCV_Enabled.BoolValue || IsFakeClient(client))
+	if (!gCV_Enabled.BoolValue || gB_Suspended[client] || IsFakeClient(client) || SegFreezing(client))
 	{
 		return;
 	}
@@ -73,15 +122,23 @@ public void Shavit_OnCheckpointCacheLoaded(int client, cp_cache_t cache, int ind
 	GetEntDataVector(client, gI_PlayerState + V_ANGLE_OFFSET, target);
 	GetEntDataVector(client, gI_PlayerState + ANGLECHANGE_OFFSET, change);
 
-	float d = NormalizeYaw(target[1] - (gF_LastYaw[client] + PendingShift(client)));
+	float shift[2], d[2];
+	PendingShift(client, shift);
+
+	for (int i = 0; i < 2; i++)
+	{
+		d[i] = NormalizeAngle(target[i] - (gF_LastAngles[client][i] + shift[i]));
+	}
+
 	int n = gI_PendingCount[client];
 
 	// Non-zero anglechange hasn't been sent yet, so merge into it
-	if (change[1] != 0.0 && n > 0)
+	if ((change[0] != 0.0 || change[1] != 0.0) && n > 0)
 	{
-		gF_Pending[client][n - 1] += d;
+		gF_Pending[client][n - 1][0] += d[0];
+		gF_Pending[client][n - 1][1] += d[1];
 	}
-	else if (d != 0.0)
+	else if (d[0] != 0.0 || d[1] != 0.0)
 	{
 		if (n == MAX_PENDING)
 		{
@@ -89,13 +146,14 @@ public void Shavit_OnCheckpointCacheLoaded(int client, cp_cache_t cache, int ind
 			n--;
 		}
 
-		gF_Pending[client][n] = d;
+		gF_Pending[client][n][0] = d[0];
+		gF_Pending[client][n][1] = d[1];
 		gI_PendingTick[client][n] = GetGameTickCount();
 		gI_PendingCount[client]++;
 	}
 
-	change[0] = 0.0;
-	change[1] += d;
+	change[0] += d[0];
+	change[1] += d[1];
 	change[2] = 0.0;
 
 	SetEntData(client, gI_PlayerState + FIXANGLE_OFFSET, FIXANGLE_RELATIVE);
@@ -109,47 +167,59 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
 		return Plugin_Continue;
 	}
 
-	float delta = NormalizeYaw(angles[1] - gF_LastYaw[client]);
-	float jump = delta - gF_LastDelta[client];
+	float delta[2], jump[2];
 
-	gF_LastYaw[client] = angles[1];
-	gF_LastDelta[client] = delta;
+	for (int i = 0; i < 2; i++)
+	{
+		delta[i] = NormalizeAngle(angles[i] - gF_LastAngles[client][i]);
+		jump[i] = delta[i] - gF_LastDelta[client][i];
+
+		gF_LastAngles[client][i] = angles[i];
+		gF_LastDelta[client][i] = delta[i];
+	}
 
 	if (gI_PendingCount[client] > 0)
 	{
-		float d = gF_Pending[client][0];
+		float dp = gF_Pending[client][0][0];
+		float dy = gF_Pending[client][0][1];
 		int tick = gI_PendingTick[client][0];
 
 		// First command after the client applies d jumps by about d
-		if (tickcount >= tick && (FloatAbs(jump - d) < FloatAbs(jump) || tickcount > tick + gCV_Window.IntValue))
+		float miss = FloatAbs(jump[0] - dp) + FloatAbs(jump[1] - dy);
+
+		if (tickcount >= tick && (miss < FloatAbs(jump[0]) + FloatAbs(jump[1]) || tickcount > tick + gCV_Window.IntValue))
 		{
-			gF_LastDelta[client] = delta - d;
+			gF_LastDelta[client][0] = delta[0] - dp;
+			gF_LastDelta[client][1] = delta[1] - dy;
 			PopPending(client);
 		}
 	}
 
-	float shift = PendingShift(client);
+	float shift[2];
+	PendingShift(client, shift);
 
-	if (shift == 0.0)
+	if (shift[0] == 0.0 && shift[1] == 0.0)
 	{
 		return Plugin_Continue;
 	}
 
-	angles[1] = NormalizeYaw(angles[1] + shift);
+	// The client clamps pitch the same way when it applies the change
+	angles[0] = ClampPitch(angles[0] + shift[0]);
+	angles[1] = NormalizeAngle(angles[1] + shift[1]);
 
 	return Plugin_Changed;
 }
 
-float PendingShift(int client)
+void PendingShift(int client, float shift[2])
 {
-	float shift = 0.0;
+	shift[0] = 0.0;
+	shift[1] = 0.0;
 
 	for (int i = 0; i < gI_PendingCount[client]; i++)
 	{
-		shift += gF_Pending[client][i];
+		shift[0] += gF_Pending[client][i][0];
+		shift[1] += gF_Pending[client][i][1];
 	}
-
-	return shift;
 }
 
 void PopPending(int client)
@@ -158,22 +228,38 @@ void PopPending(int client)
 
 	for (int i = 0; i < gI_PendingCount[client]; i++)
 	{
-		gF_Pending[client][i] = gF_Pending[client][i + 1];
+		gF_Pending[client][i][0] = gF_Pending[client][i + 1][0];
+		gF_Pending[client][i][1] = gF_Pending[client][i + 1][1];
 		gI_PendingTick[client][i] = gI_PendingTick[client][i + 1];
 	}
 }
 
-float NormalizeYaw(float yaw)
+float NormalizeAngle(float angle)
 {
-	while (yaw > 180.0)
+	while (angle > 180.0)
 	{
-		yaw -= 360.0;
+		angle -= 360.0;
 	}
 
-	while (yaw < -180.0)
+	while (angle < -180.0)
 	{
-		yaw += 360.0;
+		angle += 360.0;
 	}
 
-	return yaw;
+	return angle;
+}
+
+float ClampPitch(float pitch)
+{
+	if (pitch > 89.0)
+	{
+		return 89.0;
+	}
+
+	if (pitch < -89.0)
+	{
+		return -89.0;
+	}
+
+	return pitch;
 }
