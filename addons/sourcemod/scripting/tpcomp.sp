@@ -1,5 +1,6 @@
 #include <sourcemod>
 #include <sdktools>
+#include <sdkhooks>
 #include <dhooks>
 
 #pragma semicolon 1
@@ -46,6 +47,20 @@ float gF_PendingFrom[MAXPLAYERS+1][MAX_PENDING];
 
 bool gB_SnapWaiting[MAXPLAYERS+1];
 
+bool gB_Suspended[MAXPLAYERS+1];
+
+bool gB_Predicts[MAXPLAYERS+1];
+
+int gI_TriggerToucher;
+
+public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max)
+{
+	CreateNative("TPComp_Suspend", Native_Suspend);
+	CreateNative("TPComp_SetClientPredicts", Native_SetClientPredicts);
+	RegPluginLibrary("tpcomp");
+	return APLRes_Success;
+}
+
 public void OnPluginStart()
 {
 	gCV_Enabled = CreateConVar("sm_tpcomp_enabled", "1", "Compensate teleport angles for latency.", 0, true, 0.0, true, 1.0);
@@ -82,11 +97,46 @@ public void OnPluginStart()
 			OnClientPutInServer(client);
 		}
 	}
+
+	int entity = -1;
+
+	while ((entity = FindEntityByClassname(entity, "trigger_teleport")) != -1)
+	{
+		HookTrigger(entity);
+	}
+}
+
+public void OnEntityCreated(int entity, const char[] classname)
+{
+	if (StrEqual(classname, "trigger_teleport"))
+	{
+		HookTrigger(entity);
+	}
+}
+
+void HookTrigger(int entity)
+{
+	SDKHook(entity, SDKHook_Touch, Trigger_Touch);
+	SDKHook(entity, SDKHook_TouchPost, Trigger_TouchPost);
+}
+
+// trigger_teleport teleports from Touch, so this tells its teleports apart from others
+public Action Trigger_Touch(int entity, int other)
+{
+	gI_TriggerToucher = other;
+	return Plugin_Continue;
+}
+
+public void Trigger_TouchPost(int entity, int other)
+{
+	gI_TriggerToucher = 0;
 }
 
 public void OnClientPutInServer(int client)
 {
 	gI_PendingCount[client] = 0;
+	gB_Suspended[client] = false;
+	gB_Predicts[client] = false;
 
 	if (!IsFakeClient(client))
 	{
@@ -103,6 +153,32 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
 	{
 		gI_PendingCount[client] = 0;
 	}
+}
+
+public any Native_Suspend(Handle plugin, int numParams)
+{
+	int client = GetNativeCell(1);
+
+	if (client < 1 || client > MaxClients)
+	{
+		return ThrowNativeError(SP_ERROR_NATIVE, "Invalid client index %d", client);
+	}
+
+	gB_Suspended[client] = GetNativeCell(2);
+	return 0;
+}
+
+public any Native_SetClientPredicts(Handle plugin, int numParams)
+{
+	int client = GetNativeCell(1);
+
+	if (client < 1 || client > MaxClients)
+	{
+		return ThrowNativeError(SP_ERROR_NATIVE, "Invalid client index %d", client);
+	}
+
+	gB_Predicts[client] = GetNativeCell(2);
+	return 0;
 }
 
 // Notes whether this teleport will overwrite one of our snaps that hasn't gone out yet
@@ -136,7 +212,12 @@ public MRESReturn Teleport_Post(int client, DHookParam params)
 		gI_PendingCount[client]--;
 	}
 
-	if (!gCV_Enabled.BoolValue)
+	if (!gCV_Enabled.BoolValue || gB_Suspended[client])
+	{
+		return MRES_Ignored;
+	}
+
+	if (gB_Predicts[client] && gI_TriggerToucher == client)
 	{
 		return MRES_Ignored;
 	}
